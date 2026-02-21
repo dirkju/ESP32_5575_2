@@ -2,8 +2,6 @@
 
 #include <ESP32SPISlave.h>      // https://github.com/hideakitai/ESP32SPISlave
 
-#include "../InfluxDB/MyInfluxDB.h"
-
 
 // ########### Public variables (in .h-file, too) #############
 
@@ -12,12 +10,9 @@ constexpr uint32_t BUFFER_SIZE {32};
 uint8_t spi_slave_tx_buf[BUFFER_SIZE];
 uint8_t spi_slave_rx_buf[BUFFER_SIZE];
 
-// the core number the task should run on (0 or 1)
 constexpr uint8_t CORE_TASK_SPI_SLAVE {1};
-constexpr uint8_t CORE_TASK_PROCESS_BUFFER {1};
 
-static TaskHandle_t task_handle_wait_spi = 0;
-static TaskHandle_t task_handle_process_buffer = 0;
+static TaskHandle_t task_handle_spi = 0;
 
 uint32_t transactionNo = 0;
 volatile bool cs_last = false;
@@ -27,38 +22,33 @@ uint8_t rk1Stell [38];
 int rkIdx = 0;
 
 bool requestDataFromMaster = false;
-uint32_t pollDataDelay_ms = 10000;
+uint32_t pollDataDelay_ms = 5000;
 int64_t lastDataRequestTime = 0;
 
-// int (in transaction cycles)
-// 0 - set MISO high (master sees slave)
-// 1 - send "slave-ready-to-send-command-to-master" msg (0xF9)
-// 2 - ... send register data requests
-// last - send coil data request
-uint8_t requestDataFromMaster_stage = 0; 
+// Stage counter:
+// 0 - first handshake transaction (tx=0xFF, tell master slave is present)
+// 1 - send slaveReadyCommand (0xF9)
+// 2..N+1 - send register read commands, receive results
+// N+2 - send coil read command, receive result
+// N+3 - all done, print summary and reset
+uint8_t requestDataFromMaster_stage = 0;
 
 // ########### Private variables #############
 
 #define pin_inv_SS 25
 #define pin_inv_SS_OUT 26
 
-
-
-
-
-// Slave answers this on MISO so master sees that slave wants to send commands?
+// Slave answers this on MISO so master sees that slave wants to send commands
 uint8_t slaveRadyCommand[] = {
-    0xF9 
+    0xF9
 };
 
-
-
 uint8_t readARegister_cmd [] = {
-    0x06, 0x0C, 0x00, 0xFA, 0x08, 0xFF, 
-    0x03, // FunctionID 3 = read 
-    0xFF, 0xFF, // start register No (to be replaced by revolveCommand())
+    0x06, 0x0C, 0x00, 0xFA, 0x08, 0xFF,
+    0x03, // FunctionID 3 = read
+    0xFF, 0xFF, // start register No (replaced by revolveReadRegisterCommand())
     0x00, 0x01, // number of registers to read (= 1)
-    0xFF, 0xFF, // CRC checksum (to be replaced by revolveCommand())
+    0xFF, 0xFF, // CRC checksum (replaced by revolveReadRegisterCommand())
     0x55
 };
 int NUM_READAREGISTER_CMD = sizeof(readARegister_cmd);
@@ -70,26 +60,24 @@ uint16_t registersToRead[] = {
     0x0010, // RueckltempRueF1
     0x0016, // SpeichertempSF1
     0x001C, // Meßwert [Imp/h] am Eingang WMZ
-    // 0x0062, // MaxVorlSollw, Maximaler Vorlaufsollwert des Reglers
-    0x006A, // StellsignalRk1, Stellsignal Rk1 [0...100%] (CL90)
-    0x03E7 // VorlSollwRk1, Vorlaufsollwert Rk1 (CL116)
+    0x006A, // StellsignalRk1 [0...100%] (CL90)
+    0x03E7  // VorlSollwRk1 (CL116)
 };
 int NUM_REGISTERS_TO_READ = (sizeof(registersToRead) / sizeof(uint16_t));
 
-char* registerNames  [] = {
+const char* registerNames[] = {
     "Geraetekennung",
     "Aussenfuehler_1_AF1",
     "Vorlauftemperatur_VF1",
     "Rueckltemperatur_RueF1",
     "Speichertemperatur_SF1",
     "Eingang_WMZ_Imp_h",
-    // "MaxVorlSollwert",
     "Stellsignal_Rk1",
     "Vorlaufsollwert_Rk1",
     "Coils"
 };
 
-uint16_t registerValues  [] = {
+uint16_t registerValues[] = {
     0x1FFF,
     0x1FFF,
     0x1FFF,
@@ -101,284 +89,237 @@ uint16_t registerValues  [] = {
     0x1FFF // coils
 };
 
-
-
-// Coild 56 - 71, 56 = Umwaelzpumpe Rk1 (UP1 Netzseite, CL96), 59 = Speicherladepumpe TW (SLP, CL99)
-uint8_t readCoils [] = {
+// Coils 56-71
+uint8_t readCoils[] = {
     0x06, 0x0B, 0xFA, 0x08, 0xFF, 0x01, 0x00, 0x38, 0x00, 0x0F, 0xE8, 0x1D, 0x55
 };
 
-
-// read 1 register, stating from 0x00, Gerätetyp "5575"
-uint8_t readCommand_inv[] = 
-    {0xF9, 0xF3, 0xFF, 0x05, 0xF7, 0x00, 0xFC, 0xFF, 0xFF, 0xFF, 0xFE, 0x6E, 0x2B, 0xAA} 
+uint8_t readCommand_crc[] =
+    {0xFF, 0x03, 0x00, 0x00, 0x00, 0x01}
 ;
 
-uint8_t readCommand_crc_inv[] = 
-    {0x00, 0xFC, 0xFF, 0xFF, 0xFF, 0xFE} 
-;
+// ########### Serial output helpers #############
 
-uint8_t readCommand_crc[] = 
-    {0xFF, 0x03, 0x00, 0x00, 0x00, 0x01} // 0x91 0xD4
-;
+static void printSPITransaction(uint32_t txnNo, uint8_t stage) {
+    Serial.printf("[TXN #%lu | stage %d]\n", txnNo, stage);
+    Serial.print("  TX (MISO):");
+    for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
+        Serial.printf(" %02X", spi_slave_tx_buf[i]);
+    }
+    Serial.println();
+    Serial.print("  RX (MOSI):");
+    for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
+        Serial.printf(" %02X", spi_slave_rx_buf[i]);
+    }
+    Serial.println();
+}
 
-// ########### Functions #############
+static void printAllRegisters() {
+    Serial.println("===== TROVIS 5575 DATA =====");
+    Serial.printf("  %-30s: %u  (0x%04X)\n",
+        registerNames[0], (unsigned int)registerValues[0], registerValues[0]);
+    Serial.printf("  %-30s: %.1f C  (0x%04X)\n",
+        registerNames[1], (signed int)registerValues[1] / 10.0f, registerValues[1]);
+    for (int i = 2; i <= 4; i++) {
+        Serial.printf("  %-30s: %.1f C  (0x%04X)\n",
+            registerNames[i], (unsigned int)registerValues[i] / 10.0f, registerValues[i]);
+    }
+    Serial.printf("  %-30s: %u  (0x%04X)\n",
+        registerNames[5], (unsigned int)registerValues[5], registerValues[5]);
+    Serial.printf("  %-30s: %u %%  (0x%04X)\n",
+        registerNames[6], (unsigned int)registerValues[6], registerValues[6]);
+    Serial.printf("  %-30s: %.1f C  (0x%04X)\n",
+        registerNames[7], (unsigned int)registerValues[7] / 10.0f, registerValues[7]);
+    uint16_t coils = registerValues[8];
+    Serial.printf("  %-30s: (0x%04X)\n", registerNames[8], coils);
+    Serial.printf("    C56 Umwaelzpumpe Rk1         : %d\n", (coils >> 15) & 1);
+    Serial.printf("    C57 Umwaelzpumpe Rk2         : %d\n", (coils >> 14) & 1);
+    Serial.printf("    C58                          : %d\n", (coils >> 13) & 1);
+    Serial.printf("    C59 Speicherladepumpe TW     : %d\n", (coils >> 12) & 1);
+    Serial.printf("    C60 Zirkulationspumpe        : %d\n", (coils >> 11) & 1);
+    Serial.printf("    C61 Rk1 3-Pkt Zu-Signal      : %d\n", (coils >> 10) & 1);
+    Serial.printf("    C62 Rk1 3-Pkt Auf-Signal     : %d\n", (coils >>  9) & 1);
+    Serial.printf("    C63 Rk2 3-Pkt Zu-Signal      : %d\n", (coils >>  8) & 1);
+    Serial.printf("    C64 Rk2 3-Pkt Auf-Signal     : %d\n", (coils >>  7) & 1);
+    Serial.printf("    C65                          : %d\n", (coils >>  6) & 1);
+    Serial.printf("    C66                          : %d\n", (coils >>  5) & 1);
+    Serial.printf("    C67 Pumpenmanag. UP1 Ein/Aus : %d\n", (coils >>  4) & 1);
+    Serial.printf("    C68 Pumpenmanag. Drehzahl UP1: %d\n", (coils >>  3) & 1);
+    Serial.printf("    C69                          : %d\n", (coils >>  2) & 1);
+    Serial.printf("    C70                          : %d\n", (coils >>  1) & 1);
+    Serial.printf("    C71                          : %d\n", (coils >>  0) & 1);
+    Serial.println("============================");
+}
+
+// ########### SPI helpers #############
 
 void set_tx_buffer(uint8_t value) {
-    // memset(spi_slave_tx_buf, value, BUFFER_SIZE);
     for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
         spi_slave_tx_buf[i] = value;
     }
 }
 
 void set_tx_buffer(uint8_t* command, uint32_t size) {
-    // have MOSI "high" while reading the reponse on MISO in this transaction
-    memset(spi_slave_tx_buf, 255, BUFFER_SIZE);
+    memset(spi_slave_tx_buf, 0xFF, BUFFER_SIZE);
     for (uint32_t i = 0; i < size; i++) {
         spi_slave_tx_buf[i] = command[i];
     }
 }
 
-// See setupSPISlave()
-ICACHE_RAM_ATTR void slave_signal_from_master () {
+// ISR: inverts the Trovis CS signal (idle-low, active-high) onto G26 → G5
+IRAM_ATTR void slave_signal_from_master() {
     cs = !cs;
     if (!cs) {
         digitalWrite(pin_inv_SS_OUT, HIGH); // Idle
     } else {
-        digitalWrite(pin_inv_SS_OUT, LOW); // select
+        digitalWrite(pin_inv_SS_OUT, LOW);  // Select
     }
 }
 
-void revolveReadRegisterCommand () {
-
+void revolveReadRegisterCommand() {
     uint16_t registerToRead = registersToRead[requestDataFromMaster_stage - 2];
 
-    uint8_t p1 = (uint8_t) ((registerToRead >> 8) & 0xFF);
-    uint8_t p2 = (uint8_t) (registerToRead & 0xFF);
+    uint8_t p1 = (uint8_t)((registerToRead >> 8) & 0xFF);
+    uint8_t p2 = (uint8_t)(registerToRead & 0xFF);
 
     readARegister_cmd[7] = p1;
     readARegister_cmd[8] = p2;
-
     readCommand_crc[2] = p1;
     readCommand_crc[3] = p2;
-    
+
     uint16_t crc = MODBUS_CRC16_v3(readCommand_crc, sizeof(readCommand_crc));
+    readARegister_cmd[11] = (uint8_t)((crc >> 8) & 0xFF);
+    readARegister_cmd[12] = (uint8_t)(crc & 0xFF);
 
-    uint8_t c1 = (uint8_t) ((crc >> 8) & 0xFF);
-    uint8_t c2 = (uint8_t) (crc & 0xFF);
-    
-    readARegister_cmd[11] = c1;
-    readARegister_cmd[12] = c2;
-    
     uint8_t read_cmd_inv[NUM_READAREGISTER_CMD];
-    // invert everything
     for (uint8_t k = 0; k < NUM_READAREGISTER_CMD; k++) {
-        read_cmd_inv[k] = (0xFF - readARegister_cmd[k]);
+        read_cmd_inv[k] = 0xFF - readARegister_cmd[k];
     }
     set_tx_buffer(read_cmd_inv, sizeof(read_cmd_inv));
 }
 
-void revolveReadCoilCommand () {
+void revolveReadCoilCommand() {
     uint8_t read_cmd_inv[sizeof(readCoils)];
-    // invert everything
     for (uint8_t k = 0; k < sizeof(readCoils); k++) {
-        read_cmd_inv[k] = (0xFF - readCoils[k]);
+        read_cmd_inv[k] = 0xFF - readCoils[k];
     }
     set_tx_buffer(read_cmd_inv, sizeof(read_cmd_inv));
 }
 
-void processSPISlaveResult () {
-    
-    /*
-    Serial.printf("%d (stage: %d) Processe buffer (size: %d)\n", micros(), requestDataFromMaster_stage, slave.available());
-    for (uint8_t k = 0; k < BUFFER_SIZE; k++) {
-        Serial.printf(" %d TX - MISO: spi_slave_tx_buf    [0x%02x]\n", k, (spi_slave_tx_buf[k]));
-    }
-    Serial.printf("---\n");
-    for (uint8_t k = 0; k < BUFFER_SIZE; k++) {
-        Serial.printf(" %d RX - MOSI: spi_slave_rx_buf    [0x%02x]\n", k, (spi_slave_rx_buf[k]));
-    }*/
+// ########### Main SPI task #############
 
-    
-    if (requestDataFromMaster_stage <= 1) {
-        // answer should be empty, Master ready so serve data
-    } else if (requestDataFromMaster_stage < (NUM_REGISTERS_TO_READ + 2)) {
-        // this is a register-read result...
-        registerValues[requestDataFromMaster_stage - 2] = 
-            (spi_slave_rx_buf[5 + NUM_READAREGISTER_CMD] << 8) | spi_slave_rx_buf[6 + NUM_READAREGISTER_CMD];        
-        /*
-        Serial.printf("   Register [0x%02x%02x]: [0x%02x%02x] (%s)\n", 
-            (255 - spi_slave_tx_buf[7]), (255 - spi_slave_tx_buf[8]), 
-            spi_slave_rx_buf[5 + numberOfArrayElements(readARegister_cmd)], spi_slave_rx_buf[6 + numberOfArrayElements(readARegister_cmd)],
-            registerNames[requestDataFromMaster_stage - 4]
-        );*/
-    } else if (requestDataFromMaster_stage == (NUM_REGISTERS_TO_READ + 2)) {
-        // this is a coils-read result...
-        registerValues[requestDataFromMaster_stage - 2] = 
-            (spi_slave_rx_buf[5 + NUM_READAREGISTER_CMD] << 8) | spi_slave_rx_buf[6 + NUM_READAREGISTER_CMD];
-        
-        /*Serial.printf("   Coils [0x%02x%02x + 0x%02x%02x]: [0x%02x%02x]\n", 
-            (255 - spi_slave_tx_buf[6]), (255 - spi_slave_tx_buf[7]),
-            (255 - spi_slave_tx_buf[8]), (255 - spi_slave_tx_buf[9]), 
-            spi_slave_rx_buf[5 + numberOfArrayElements(readARegister_cmd)], spi_slave_rx_buf[6 + numberOfArrayElements(readARegister_cmd)]
-        );*/
-    } else {
-        Serial.printf("THIS SHOULD NOT HAPPEN!\n\n");
-    }
-    
-
-}
-
-void task_wait_spi(void* pvParameters) {
+// Single task: queue TX, block until master completes transaction, process RX, repeat.
+void spi_slave_main_task(void* pvParameters) {
     while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        // block until the transaction comes from master
-        slave.wait(spi_slave_rx_buf, spi_slave_tx_buf, BUFFER_SIZE); 
-
-/*
-        spi_slave_transaction_t* r_trans;
-        r_trans->length = 8 * BUFFER_SIZE;  // in bit size
-        r_trans->rx_buffer = spi_slave_rx_buf;
-        r_trans->tx_buffer = spi_slave_tx_buf;
-        r_trans->user = (void*)"ABC";
-*/
-        /**
-        * Queues a SPI transaction to be executed by this slave device. (The transaction queue size was specified when the slave
-        * device was initialised via spi_slave_initialize.) This function may block if the queue is full (depending on the
-        * ticks_to_wait parameter). No SPI operation is directly initiated by this function, the next queued transaction
-        * will happen when the master initiates a SPI transaction by pulling down CS and sending out clock signals.
-        */
-/*
-        esp_err_t e = spi_slave_queue_trans(VSPI_HOST, r_trans, portMAX_DELAY);
-        if (e != ESP_OK) {
-            printf("[ERROR] SPI queue trans failed : %d\n", e);
-        } else {
-*/
-            /**
-            * This routine will wait until a transaction to the given device (queued earlier with
-            * spi_slave_queue_trans) has succesfully completed. It will then return the description of the
-            * completed transaction so software can inspect the result and e.g. free the memory or
-            * re-use the buffers.
-            *
-            * It is mandatory to eventually use this function for any transaction queued by ``spi_slave_queue_trans``.
-            */
-/*
-            esp_err_t e = spi_slave_get_trans_result(VSPI_HOST, &r_trans, portMAX_DELAY);
-            if (e != ESP_OK) {
-                printf("[ERROR] SPI slave get trans result failed : %d\n", e);
-            }
+        // Poll trigger: start a new Modbus read cycle every pollDataDelay_ms
+        if (!requestDataFromMaster && (millis() - lastDataRequestTime) > pollDataDelay_ms) {
+            requestDataFromMaster_stage = 0;
+            requestDataFromMaster = true;
+            Serial.printf("\n--- Begin poll cycle #%lu at %lu ms ---\n", transactionNo, (uint32_t)millis());
         }
-*/
-        // had-over to process-buffer-task
-        xTaskNotifyGive(task_handle_process_buffer);
-    }
-}
 
-void task_process_buffer(void* pvParameters) {
-    while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);        
+        // Prepare current TX buffer and wait for master to clock in a transaction
+        slave.queue(spi_slave_tx_buf, spi_slave_rx_buf, BUFFER_SIZE);
+        slave.wait(); // blocks until master completes the transaction
+
+        // Print raw bytes for every transaction
+        printSPITransaction(transactionNo, requestDataFromMaster_stage);
 
         if (requestDataFromMaster) {
 
-            // processSPISlaveResult();
+            // --- Process received data ---
             if (requestDataFromMaster_stage <= 1) {
-                // do nothing with answer
+                Serial.printf("  [stage %d] Handshake\n", requestDataFromMaster_stage);
+
             } else if (requestDataFromMaster_stage < (NUM_REGISTERS_TO_READ + 2)) {
-                // this is a register-read result...
-                registerValues[requestDataFromMaster_stage - 2] = 
-                    (spi_slave_rx_buf[5 + NUM_READAREGISTER_CMD] << 8) | spi_slave_rx_buf[6 + NUM_READAREGISTER_CMD];      
+                registerValues[requestDataFromMaster_stage - 2] =
+                    ((uint16_t)spi_slave_rx_buf[5 + NUM_READAREGISTER_CMD] << 8) |
+                    spi_slave_rx_buf[6 + NUM_READAREGISTER_CMD];
+                Serial.printf("  [stage %d] %-26s [0x%04X] = 0x%04X\n",
+                    requestDataFromMaster_stage,
+                    registerNames[requestDataFromMaster_stage - 2],
+                    registersToRead[requestDataFromMaster_stage - 2],
+                    registerValues[requestDataFromMaster_stage - 2]);
+
                 if (requestDataFromMaster_stage - 2 == 6) { // Stellsignal Rk1
-                    rk1Stell[rkIdx] = (uint8_t) spi_slave_rx_buf[6 + NUM_READAREGISTER_CMD];
-                    rkIdx ++;
-                    if (rkIdx > 37) {
-                        rkIdx = 0;
-                    }
-                }  
+                    rk1Stell[rkIdx] = spi_slave_rx_buf[6 + NUM_READAREGISTER_CMD];
+                    if (++rkIdx > 37) rkIdx = 0;
+                }
+
             } else if (requestDataFromMaster_stage == (NUM_REGISTERS_TO_READ + 2)) {
-                // this is a coils-read result...
-                registerValues[requestDataFromMaster_stage - 2] = 
-                    (spi_slave_rx_buf[5 + NUM_READAREGISTER_CMD] << 8) | spi_slave_rx_buf[6 + NUM_READAREGISTER_CMD];
+                registerValues[requestDataFromMaster_stage - 2] =
+                    ((uint16_t)spi_slave_rx_buf[5 + NUM_READAREGISTER_CMD] << 8) |
+                    spi_slave_rx_buf[6 + NUM_READAREGISTER_CMD];
+                Serial.printf("  [stage %d] Coils = 0x%04X\n",
+                    requestDataFromMaster_stage,
+                    registerValues[requestDataFromMaster_stage - 2]);
+
             } else {
-                Serial.printf("THIS SHOULD NOT HAPPEN!\n\n");
+                Serial.printf("  [stage %d] THIS SHOULD NOT HAPPEN\n", requestDataFromMaster_stage);
             }
 
+            // --- Prepare TX for next transaction ---
             requestDataFromMaster_stage++;
 
-            if (requestDataFromMaster_stage == 0) {
-                set_tx_buffer(0xFF); // high = tell master slave is there
-            } else if (requestDataFromMaster_stage == 1) {
-                set_tx_buffer(slaveRadyCommand, sizeof(slaveRadyCommand)); // tell master to prepare for commands from slave
+            if (requestDataFromMaster_stage == 1) {
+                set_tx_buffer(slaveRadyCommand, sizeof(slaveRadyCommand));
             } else if (requestDataFromMaster_stage < (NUM_REGISTERS_TO_READ + 2)) {
                 revolveReadRegisterCommand();
             } else if (requestDataFromMaster_stage == (NUM_REGISTERS_TO_READ + 2)) {
                 revolveReadCoilCommand();
             } else {
-                saveSPIDataToInflux = true;
+                // All data collected
+                printAllRegisters();
                 requestDataFromMaster_stage = 0;
-                lastDataRequestTime = millis(); // wait for pollDataDelay_ms until fetch the next time the same data
-                requestDataFromMaster = false; 
-                set_tx_buffer(0x00); // low = master can relax clock
+                lastDataRequestTime = millis();
+                requestDataFromMaster = false;
+                set_tx_buffer(0x00);
             }
+
         } else {
-            set_tx_buffer(0x00); // low = master can relax clock
+            set_tx_buffer(0x00); // idle: tell master clock can relax
         }
 
-        slave.pop();
         transactionNo++;
-        
-        // hand-over to wait-task
-        xTaskNotifyGive(task_handle_wait_spi);
     }
 }
 
 
-void setupSPISlave () {
-    // HSPI = CS: 15, CLK: 14, MOSI: 13, MISO: 12
-    // VSPI = CS: 5, CLK: 18, MOSI: 23, MISO: 19
-
-    // Trovis 5575 sends an invertes "Slave Select" signal (idle = low, slave select = high)
-    // So by using this interrupt service routine with an "input" pin connected to this
-    // inverted "slave select" line from master, we trigger (inverted to master's signal) 
-    // another "output" pin which is connected to the actual "slave select" pin of our ESP32.  
-    pinMode(pin_inv_SS, INPUT);
+void setupSPISlave() {
+    // VSPI pins: CS=5, CLK=18, MOSI=23, MISO=19
+    // Trovis CS is inverted: G25 (input) → ISR inverts → G26 (output) → G5 (ESP32 SPI CS)
+    pinMode(pin_inv_SS, INPUT_PULLDOWN);
     attachInterrupt(digitalPinToInterrupt(pin_inv_SS), slave_signal_from_master, CHANGE);
 
     pinMode(pin_inv_SS_OUT, OUTPUT);
     digitalWrite(pin_inv_SS_OUT, HIGH); // Idle = HIGH
 
-    // digitalWrite(MISO, HIGH); // this signals Trovis 5575 that a slave is present
-    
-    // slave.setDataMode(SPI_MODE0); // Clock polarity = 0, Clock phase = 0
-    // slave.setDataMode(SPI_MODE1); // Clock polarity = 0, Clock phase = 1
-    // slave.setDataMode(SPI_MODE2); // Clock polarity = 1, Clock phase = 0
-    slave.setDataMode(SPI_MODE3); // Clock polarity = 1, Clock phase = 1
-    slave.setQueueSize(1);  // transaction queue size
-    
+    slave.setDataMode(SPI_MODE3); // Trovis uses CPOL=1, CPHA=1
+    slave.setQueueSize(1);
+
     set_tx_buffer(0x00);
-    
+
     slave.begin(VSPI, SCK, MISO, MOSI, SS);
 
     xTaskCreatePinnedToCore(
-        task_wait_spi,      //Function to implement the task 
-        "task_wait_spi",    //Name of the task
-        2048,               //Stack size in words 
-        NULL,               //Task input parameter 
-        2,                  //Priority of the task 
-        &task_handle_wait_spi,  //Task handle.
-        CORE_TASK_SPI_SLAVE //Core no where the task should run 
+        spi_slave_main_task,    // task function
+        "spi_slave_main",       // name
+        4096,                   // stack size (words) — larger for Serial.printf
+        NULL,                   // parameter
+        2,                      // priority
+        &task_handle_spi,       // handle
+        CORE_TASK_SPI_SLAVE     // core
     );
-    xTaskNotifyGive(task_handle_wait_spi);
-
-    xTaskCreatePinnedToCore(task_process_buffer, "task_process_buffer", 2048, NULL, 2, &task_handle_process_buffer, CORE_TASK_PROCESS_BUFFER);    
 
     lastDataRequestTime = millis();
+
+    Serial.println("SPI Slave ready. Waiting for poll trigger...");
+    Serial.printf("Poll interval: %lu ms\n", pollDataDelay_ms);
 }
 
 
-
 // https://github.com/LacobusVentura/MODBUS-CRC16
-uint16_t MODBUS_CRC16_v3( const unsigned char *buf, unsigned int len ) {
+uint16_t MODBUS_CRC16_v3(const unsigned char *buf, unsigned int len) {
 	const uint16_t table[256] = {
 	0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
 	0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
@@ -416,14 +357,12 @@ uint16_t MODBUS_CRC16_v3( const unsigned char *buf, unsigned int len ) {
 	uint8_t xor_ = 0;
 	uint16_t crc = 0xFFFF;
 
-	while( len-- )
-	{
+	while (len--) {
 		xor_ = (*buf++) ^ crc;
 		crc >>= 8;
 		crc ^= table[xor_];
 	}
 
-    uint16_t swapped = (crc>>8) | (crc<<8);
-    // Serial.printf(" CRC3   [0x%04x]\n", swapped);
+    uint16_t swapped = (crc >> 8) | (crc << 8);
 	return swapped;
 }
