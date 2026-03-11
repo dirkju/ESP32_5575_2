@@ -7,6 +7,7 @@ void setup() {
         ; // wait for serial attach
 
     Serial.println("\n=== ESP32 Trovis 5575 Test Setup ===");
+    Serial.printf("Build: %s %s\n", __DATE__, __TIME__);
 
     setupConfig();
     setupSPISlave();
