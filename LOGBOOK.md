@@ -97,6 +97,71 @@ Early exploration with passive mode and T1/T2 split (two separate SPI slots). No
 
 ---
 
+### Experiment 6 — 2026-03-11
+**Serial log**: `serial-log-2026-03-11-6.txt`
+**PulseView CSV**: `trovis-comms-spi-esp32-2026-03-11-6-a.csv`
+
+**Setup**: Single-slot state machine (PSV → ANN → CMD × 8 → PSV). SPI_MODE3. ISR uses `digitalRead()`. Re-arm with `queue()` immediately after `wait()`, before any Serial output. ESP32SPISlave v0.8.0.
+
+**Observations**:
+- **Progress**: MISO is no longer 0x00 — ESP32 IS driving the MISO line. (Fixed since experiments 4–5 by code restructuring.)
+- **Serial log**: PSV shows `MOSI = 00 00 00 00`, all ANN/CMD show `MOSI = 18 00 00 00`, `rxLen = 4`, "too short" throughout.
+- **PulseView (MODE3 decoder, 5× oversampling)**:
+  - Txn 1: `MISO = F3 FF FF FF`, `MOSI = 30 00 00 00`
+  - Txn 2: `MISO = F3 CF F8`, `MOSI = 30 00 00`
+  - Txn 3: `MISO = F3 CF F8 1E`, `MOSI = 30 00 00 00`
+- Signal quality: stable, no glitches. Same MISO decode across all SPI modes 0–3 in PulseView.
+- MOSI 1-bit shift persists: wire = `0x30`, ESP32 receives `0x18`.
+
+**Analysis**:
+- MISO outputs **F3** instead of the expected **F9**. Both MISO and MOSI show a consistent 1-bit shift:
+  - MOSI: `0x30` (00110000) on wire → ESP32 reads `0x18` (00011000) = right-shift by 1
+  - MISO: ESP32 sends `0xF9` (11111001) → wire shows `0xF3` (11110011)
+- The MISO values for CMD transactions (`F3 CF F8`) do NOT match a simple bit shift of the expected CMD bytes (`F9 F3 FF 05`). The corruption pattern is more complex than a single-bit phase offset.
+- Because Trovis never sees `0x06` (inverted from `0xF9`), it doesn't extend the transaction to 32 bytes. All CMDs remain 4B with "too short" errors.
+- **Root cause hypothesis**: The new ESP32SPISlave v0.8.0 API (`slave.queue()` + `slave.wait()`) loads the SPI TX FIFO differently from Benvorth's proven old API (`slave.wait(rx, tx, size)` + `slave.pop()`). Benvorth's version produced correct F9 on MISO. This is the only significant difference between the two setups.
+
+### Experiment 7 — 2026-03-11
+**Serial log**: `serial-log-2026-03-11-7.txt`
+**PulseView CSV**: `trovis-comms-spi-esp32-2026-03-11-7-a.csv`
+
+**Setup**: Two-task architecture (matching Benvorth). **ESP32SPISlave v0.3.0** (old API: `slave.wait(rx, tx, size)` + `slave.pop()`). SPI_MODE3. ISR uses `cs = !cs` toggle (Benvorth style). `pinMode(pin_inv_SS, INPUT)` without PULLDOWN. ESP32 Arduino core 3.3.7.
+
+**Observations**:
+- **MISO still F3 on wire** — identical to experiment 6
+- PulseView: `MISO = F3 CF F8`, `MOSI = 30 00 00` (same as exp 6)
+- Serial log: MOSI = `18 00 00 00 F7 ...` (32-byte buffers now visible with old API)
+- First cycle: ESP32 reads back its own MISO as MOSI (PSV: FF, ANN: F9) — likely crosstalk during boot before Trovis drives MOSI
+
+**Conclusions**:
+- **Library version is NOT the root cause.** v0.3.0 (old API) produces identical MISO corruption as v0.8.0 (new API).
+- Both APIs are thin wrappers around ESP-IDF's `spi_slave_transmit()` / `spi_slave_queue_trans()`. The corruption is in the ESP-IDF SPI slave driver layer.
+- Benvorth likely used Arduino ESP32 core 2.x (ESP-IDF 4.4). We use core 3.3.7 (ESP-IDF 5.x). The ESP-IDF SPI slave driver was reworked between versions.
+
+---
+
+### Experiment 8 — 2026-03-12
+**Serial log**: `serial-log-2026-03-12-8.txt`
+**PulseView CSV**: `trovis-comms-spi-esp32-2026-03-12-8-a.csv`
+
+**Setup**: Same as experiment 7 + direct SPI register patch after `slave.begin()`:
+```c
+SPI3.pin.ck_idle_edge = 1;  // Clock idles HIGH (CPOL=1)
+SPI3.user.ck_i_edge = 1;    // Input sampled on correct edge
+```
+Motivated by known ESP-IDF bug reports: GitHub issues espressif/esp-idf #7698, #15762, #9058.
+
+**Observations**:
+- **MISO still F3 on wire** — unchanged
+- **MOSI reception changed**: ESP32 now reads `F9` (its own MISO output) instead of `18` (shifted Trovis MOSI). The `ck_i_edge` change shifted the MOSI sampling edge, causing ESP32 to read back its own MISO via crosstalk.
+
+**Conclusions**:
+- The one-time register patch in `setupSPISlave()` either (a) addresses the wrong registers, or (b) is overwritten by `spi_slave_transmit()` which reconfigures SPI registers before each transaction.
+- The `ck_i_edge = 1` change DID affect MOSI sampling (proving the register write works), but did not fix MISO output timing. This suggests a different register controls MISO output edge.
+- The ESP-IDF bug reports (#7698, #15762, #9058) mostly describe first-bit-only corruption, which is a narrower symptom than our multi-bit corruption across all bytes.
+
+---
+
 ## Key Findings
 
 | Finding | Detail |
@@ -106,10 +171,12 @@ Early exploration with passive mode and T1/T2 split (two separate SPI slots). No
 | MOSI inversion | None — read directly |
 | CS inversion | Software ISR GPIO25→GPIO26→GPIO5; 52 µs setup window is sufficient |
 | Inter-transaction gap | ~997 ms — re-arm timing is not the constraint |
-| MISO = 0x00 (root cause) | Under investigation. Library confirmed CPU FIFO mode (no DMA). SPI hardware not driving MISO before first clock — possibly interrupt latency to load TX FIFO after CS↓ |
-| No DMA | `spi_slave_initialize()` hardcoded with `SPI_DMA_DISABLED` in ESP32SPISlave v0.8.0 |
+| MISO = 0x00 (exps 4–5) | Fixed by code restructuring (immediate re-arm after wait()) |
+| MISO = 0xF3 (exps 6–8) | ESP32 drives MISO but value is wrong. Persists across both library versions AND register fix. Root cause is in ESP-IDF 5.x SPI slave driver (core 3.3.7) |
+| Library version irrelevant | v0.3.0 and v0.8.0 produce identical MISO corruption — both are thin wrappers around ESP-IDF |
+| Register patch insufficient | One-time `ck_idle_edge`/`ck_i_edge` fix after `slave.begin()` did not fix MISO; may be overwritten by `spi_slave_transmit()` per-transaction |
+| No DMA | `spi_slave_initialize()` hardcoded with `SPI_DMA_DISABLED` |
 | Single-slot is correct | Trovis uses one CS assertion for entire exchange; T1/T2 split was wrong |
-| Benvorth API difference | Old: `slave.wait(rx, tx, size)` + `slave.pop()`. New: `slave.queue(tx, rx, size)` + `slave.wait()` returns results |
 
 ---
 
@@ -146,8 +213,83 @@ The `too short` results in experiments 4–5 were caused by MISO=0x00 (Trovis ne
 
 ---
 
+### Experiment 9 — 2026-03-12
+**Serial log**: `serial-log-2026-03-12-9.txt`
+**PulseView CSV**: `trovis-comms-spi-esp32-2026-03-12-9-a.csv`
+
+**Setup**: Same as experiment 8, but register fix moved from one-time `setupSPISlave()` to `post_setup_cb` callback in local ESP32SPISlave.h copy. This ensures the fix is applied before every transaction (not overwritten by `spi_slave_transmit()`).
+```c
+inline void spi_slave_setup_done(spi_slave_transaction_t* trans) {
+    SPI3.pin.ck_idle_edge = 1;  // Clock idles HIGH (CPOL=1)
+    SPI3.user.ck_i_edge = 1;   // Correct input edge (CPHA=1)
+}
+```
+
+**Observations**:
+- **MISO still F3 on wire** — unchanged from experiments 6–8
+- PulseView: first ~4 transactions have `MISO = 00 00 00` (ESP32 not driving MISO initially), then `MISO = F3 CF F8 1E` stabilizes
+- Serial log: MOSI alternates between `F9` (own MISO readback, early txns) and `0x18` (Trovis MOSI, later txns)
+- MOSI = `F9` readback confirms `ck_i_edge = 1` IS taking effect (samples at MISO transition edge)
+- Trovis still does not extend transactions — never sees `0x06`
+- PSV transactions show `FF FF FF FF` on MISO (correct), but ANN/CMD show F3 corruption
+
+**Conclusions**:
+- **The `post_setup_cb` IS being called** — `ck_i_edge = 1` measurably affects MOSI sampling.
+- **But `ck_idle_edge` and `ck_i_edge` do NOT control MISO output timing.** These registers control clock polarity and input sampling edge, not the output data edge.
+- The register fix hypothesis from ESP-IDF bug #7698 was incomplete — those bugs describe first-bit-only corruption, while our problem is a consistent 1-bit shift across all bytes.
+
+---
+
+## ESP-IDF SPI Slave Register Analysis
+
+**Source**: `spi_ll.h` in ESP-IDF 5.x (Arduino ESP32 core 3.3.7)
+
+ESP-IDF `spi_ll_slave_set_mode()` for MODE3 sets:
+```c
+hw->pin.ck_idle_edge = 0;      // Slave inverts CPOL perception!
+hw->user.ck_i_edge = 0;        // Controls input edge + MISO delay interaction
+hw->ctrl2.miso_delay_mode = 1; // ← THIS controls MISO output timing
+hw->ctrl2.miso_delay_num = 0;
+hw->ctrl2.mosi_delay_mode = 0;
+hw->ctrl2.mosi_delay_num = 0;
+```
+
+**Critical discovery**: The slave driver **intentionally inverts `ck_idle_edge`** relative to the master. From the ESP32 TRM, the slave perceives clock polarity inverted because it observes rather than drives the clock. So for MODE3 (CPOL=1), the master uses `ck_idle_edge=1` but the slave correctly uses `ck_idle_edge=0`.
+
+**Our experiments 8–9 were setting the WRONG values!** By forcing `ck_idle_edge=1` and `ck_i_edge=1` (master MODE3 values), we were fighting the hardware design.
+
+### MISO output timing registers
+
+| Register | Controls | MODE3 default |
+|---|---|---|
+| `ck_idle_edge` | Clock idle polarity (inverted for slave) | 0 |
+| `ck_i_edge` | Input (MOSI) sampling edge; also interacts with miso_delay | 0 |
+| `ck_out_edge` | Not used in slave mode | — |
+| **`miso_delay_mode`** | **MISO output delay** | **1** |
+| `miso_delay_num` | Additional system clock delay on MISO | 0 |
+
+Per the ESP32 TRM, `miso_delay_mode` with `ck_i_edge=0`:
+- `0`: no delay
+- `1`: delayed by one full SPI clock cycle (current default)
+- `2`: delayed by half SPI clock cycle
+
+The 1-bit MISO shift (F9→F3) is consistent with the MISO delay being wrong by half a clock cycle.
+
+---
+
+### Experiment 10 — 2026-03-12
+**Setup**: Reverted `ck_idle_edge` and `ck_i_edge` to ESP-IDF defaults (0, 0). Instead, change `miso_delay_mode` in `post_setup_cb`:
+```c
+inline void spi_slave_setup_done(spi_slave_transaction_t* trans) {
+    SPI3.ctrl2.miso_delay_mode = 2;  // Try 0, 1, 2, 3 — default is 1
+}
+```
+Starting with `miso_delay_mode = 2` (half cycle delay instead of full cycle).
+
+---
+
 ## Next Steps
 
-- **Experiment 6**: Upload current code, capture serial log + PulseView CSV
-  - Success criteria: MISO shows `F9 FF FF ...` (PSV/ANN) and `F9 F3 FF 05 ...` (CMD) on wire; `rxLen = 32` for ANN and CMD transactions
-  - If MISO still 0x00: investigate whether GPIO19 (MISO) is correctly configured as SPI output; check if `slave.begin(VSPI, SCK, MISO, MOSI, SS)` pin mapping is correct for the board in use
+- **Experiment 10**: Sweep `miso_delay_mode` (0, 1, 2, 3) to find correct MISO output timing
+- **Alternative**: Try `SPI_MODE2` (CPOL=1, CPHA=0) in case ESP-IDF has modes swapped for slave
+- **Fallback**: Downgrade Arduino ESP32 core from 3.3.7 to 2.x (ESP-IDF 4.4) to match Benvorth's proven environment
